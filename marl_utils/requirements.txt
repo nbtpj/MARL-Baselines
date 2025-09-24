@@ -1,0 +1,4 @@
+torch
+gymnasium
+petting_zoo
+ray[train,tune]

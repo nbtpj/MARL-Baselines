@@ -5,6 +5,7 @@ from typing import Dict, Any
 # try:
 def init_gfootball():
     return GFootBall(
+        max_cycles=1000,
         env_name="11_vs_11_stochastic",
         representation="simple115v2",
         stacked = True,

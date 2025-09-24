@@ -6,7 +6,6 @@ This implementation is signiricantly different from author implementation:
 - Policy execution is truly decentralised via multi-threading.
 Therefore, this is NOT FINAL YET: tests on smac is being conducted to compare with author implementation!
 """
-from .utils import MulBatched
 from .utils import *
 import torch
 from torch import nn
@@ -38,11 +37,13 @@ def Polyak_update(model: nn.Module, target_model: nn.Module, tau):
 def Hard_update(model: nn.Module, target_model: nn.Module, tau):
     for param, target_param in zip(model.parameters(), target_model.parameters()):
         target_param.data.copy_(param.data)
+
     
 TARGET_UPDATE = {
     'Polyak_update': Polyak_update,
     'Hard_update': Hard_update
 }
+
 
 def build_mlp(hidden_layers, activation=nn.ReLU):
     print(hidden_layers)
@@ -264,6 +265,298 @@ class HyperMix(nn.Module):
         q_tol = (w * q_values).sum(dim=-1, keepdim=True)
         return w, q_tol
 
+
+@dataclass
+class Config:
+    # a config of all hyper-params
+    seed: int = 0
+    n_rollout_worker: int = 10
+    n_evalrollout_worker: int = 10
+    each_rollout_worker_resources: dict = field(default_factory=lambda: {"n_cpus": 2})
+    devices: Optional[List[str]] = None
+    hidden_layers: list = field(default_factory=lambda: [256,256])
+
+    lr: float = 3e-5
+    gamma: float = 0.99
+    need_state: bool = True
+    train_sample: str = 'sample_trajectories:8' # can be "sample_transitions:32"
+    discover: str = 'eps_greedy:0.05'
+     
+class LearnerGroup:
+    agents: List[str]
+    global_step: int
+
+    def load_state_dict(self, state_dict):
+        raise NotImplementedError
+    
+    def state_dict(self,):
+        raise NotImplementedError
+    
+    def update_inference_state(self, last_state: Optional[Dict] = None, Done: Optional[MulBatched] = None):
+        return {agent_id: None for agent_id in self.agents}
+    
+    def reset_last_state(self, LastState: dict, batch_id: int, agent_id):
+        # overwrite for each rnn type if needed
+        if isinstance(LastState[agent_id][batch_id], torch.Tensor):
+            LastState[agent_id][batch_id].zero_()
+        return LastState
+
+    def inference(self, obs: MulObs, sample: bool, last_state: Any, **kwargs)-> Tuple[MulAction, MulBatched, Any]:
+        raise NotImplementedError
+
+    def optimize_step(self, *args, **kwargs)->dict:
+        raise NotImplementedError
+
+class Algorithm:
+    policy: LearnerGroup
+    env_kwargs: dict
+    train_rollout_group: RolloutGroup
+    eval_rollout_group: RolloutGroup
+
+    rollout_scale: int
+    agents: List[str]
+    env_construct_fn: Callable[..., ParallelEnv]
+    env_kwargs: dict
+    config: Config
+
+
+    def __init__(self, 
+                 config: Config,
+                env_construct_fn: Callable[..., ParallelEnv],
+                env_kwargs: dict = {}) -> None:
+        self.env_construct_fn = env_construct_fn
+        self.config = config
+        self.env_kwargs = env_kwargs
+        self.train_rollout_group = self.construct_rollout_group(need_buffer=True)
+        self.eval_rollout_group = self.construct_rollout_group(need_buffer=False, is_eval=True)
+        self.agents = self.train_rollout_group.agents
+        self.learner_group = self.construct_learner_group()
+        self._Obs = None
+        self._Info = None
+        self._LastState = None
+        self._Done = None
+
+    def construct_learner_group(self, )-> LearnerGroup:
+        raise NotImplementedError()
+    
+  
+    @torch.no_grad
+    def eval_fn(self, 
+                 n_episode: int=32,
+                 verbose: Optional[Callable[[int], Any]] = None,) -> Dict:
+        """
+        Perform one-episode evaluation in an auto reset scheme
+        """
+        import math
+        import copy
+        eval_rollout_group = self.eval_rollout_group
+        inference_fn = self.learner_group.inference
+        LastIState = self.learner_group.update_inference_state(None) # for rnn policy
+        Obs, Info = eval_rollout_group.reset()
+
+        Done = {
+            agent_id: (1-Obs[agent_id].batch_mask).astype(bool)
+            for agent_id in eval_rollout_group.agents
+        } # batched all done signal
+
+        total_eps = 0
+        AllRew = {
+            agent_id: []
+            for agent_id in eval_rollout_group.agents
+        }
+        AllLastInfor = {
+            agent_id: []
+            for agent_id in eval_rollout_group.agents
+        }
+        AllEpsLen = {
+            agent_id: []
+            for agent_id in eval_rollout_group.agents
+        }
+
+        TempRew = {
+            agent_id: np.zeros_like(Obs[agent_id].batch_mask).astype(float)
+            for agent_id in eval_rollout_group.agents
+        }
+        TempLastInfor = {
+            agent_id: [None for _ in range(eval_rollout_group.n_worker)]
+            for agent_id in eval_rollout_group.agents
+        }
+        TempEpsLen = {
+            agent_id: np.zeros_like(Obs[agent_id].batch_mask).astype(float)
+            for agent_id in eval_rollout_group.agents
+        }
+
+
+        while not (total_eps>= n_episode):
+            if verbose is not None:
+                verbose.update(1)
+            Act, LogProb, LastIState = inference_fn(eval_rollout_group=eval_rollout_group, 
+                                                obs=Obs, 
+                                                sample=False,
+                                                last_state=LastIState)
+            Obs, Rew, Ter, Trunc, _ = eval_rollout_group.step(actions=Act, log_probs=LogProb)
+            _, Info = eval_rollout_group.get_last_b4_reset()
+           
+            ThisStepDone = {
+                agent_id: np.logical_and(np.logical_or(Ter[agent_id].data.astype(bool), Trunc[agent_id].data.astype(bool)),
+                                         Ter[agent_id].batch_mask.astype(bool)) 
+                for agent_id in eval_rollout_group.agents
+            }
+
+            # we add not done yet info:
+            for agent_id in eval_rollout_group.agents:
+                TempRew[agent_id][~Done[agent_id]] += Rew[agent_id][~Done[agent_id]]
+                TempEpsLen[agent_id][~Done[agent_id]] += 1
+                for idx in np.flatnonzero(~Done[agent_id]):
+                    TempLastInfor[agent_id][idx.item()] = Info[idx.item()][agent_id]
+
+            # per agent done
+            Done = {
+                agent_id: np.logical_or(Done[agent_id].astype(bool), 
+                                        ThisStepDone[agent_id].astype(bool)) 
+                for agent_id in eval_rollout_group.agents
+            }
+            AllDone = np.array([all(Done[agent_id][worker_id] for agent_id in eval_rollout_group.agents)
+                        for worker_id in range(eval_rollout_group.n_worker)])
+            
+            # now we reset doned episodes
+            for idx in np.flatnonzero(AllDone):
+                for agent_id in eval_rollout_group.agents:
+                    # add    
+                    AllRew[agent_id].append(TempRew[agent_id][idx].item())
+                    AllLastInfor[agent_id].append(copy.copy(TempLastInfor[agent_id][idx.item()]))
+                    AllEpsLen[agent_id].append(TempEpsLen[agent_id][idx])
+
+                    # reset
+                    TempRew[agent_id][idx] = 0.0
+                    TempLastInfor[agent_id][idx.item()] = None
+                    TempEpsLen[agent_id][idx] = 0.0
+                    Done[agent_id][idx] = False
+            total_eps += AllDone.astype(int).sum()
+
+        AllRew = {agent_id: AllRew[agent_id][:n_episode] for agent_id in eval_rollout_group.agents}  
+        AllEpsLen = {agent_id: AllEpsLen[agent_id][:n_episode] for agent_id in eval_rollout_group.agents}  
+        AllLastInfor = {agent_id: AllLastInfor[agent_id][:n_episode] for agent_id in eval_rollout_group.agents}  
+
+        return {
+            'return': AllRew, 'eps_len': AllEpsLen, "last_info": AllLastInfor
+        }
+
+    def construct_rollout_group(self, need_buffer=True, is_eval=False) -> RolloutGroup:
+        rollout_group = RolloutGroup(
+            env_construct_fn=self.env_construct_fn,
+            contain_buffer=need_buffer,
+            scale=self.config.n_rollout_worker if not is_eval else self.config.n_evalrollout_worker,
+            seed=self.config.seed,
+            need_state=self.config.need_state,
+            each_resource=self.config.each_rollout_worker_resources,
+            env_kwargs=self.env_kwargs)
+        return rollout_group
+    
+    def get_sample(self)-> Dict:
+        method, batch_size = self.config.train_sample.split(':')
+        batch_size = int(batch_size)
+        return getattr(self.train_rollout_group, method)(batch_size)
+
+
+    def collect_random_n_step(self, n: int, 
+                      verbose: Optional[Callable[[int], Any]] = None,):
+        if self._Obs is None:
+            # is first step
+            self._Obs, self._Info = self.train_rollout_group.reset()
+
+        for step in range(n):
+            # do one rollout step
+            Act, LogProb = self.train_rollout_group.sample_action()
+            Obs, Rew, Ter, Trunc, Info = self.train_rollout_group.step(actions=Act,
+                                                                      log_probs=LogProb)
+            if verbose is not None:
+                verbose.update(1)
+
+            # prepare for next step
+            self._Obs, self._Info = Obs, Info
+
+    def optimize_n_steps(self, n: int, 
+                      verbose: Optional[Callable[[int], Any]] = None,
+                      **kwargs) -> dict:
+        train_metrics = []
+        for step in range(n):
+            train_metric = self.learner_group.optimize_step(**self.get_sample())
+            train_metrics.append(train_metric)
+            if verbose is not None:
+                verbose.update(1)
+        eval_metric = self.eval_fn()
+        return {k: np.sum([v[k] for v in train_metrics]) \
+                      for k in train_metrics[0]}
+    
+    def wrap_with_discovery(self, Acts: MulAction, LogProbs: MulBatched, ):
+        current_eps = 0.0
+        if 'linear_epsgreedy' in self.config.discover:
+            _, start_eps, end_eps, start_step, end_step = self.config.discover.split(':')
+            start_eps, end_eps, start_step, end_step = float(start_eps), float(end_eps), float(start_step), float(end_step)
+            current_r = (self.learner_group.global_step - start_step)/(end_step - start_step)
+            current_r = max(0.0, min(current_r, 1.0))
+            current_eps = start_eps + current_r * (end_eps - start_eps)
+        elif 'epsgreedy' in self.config.discover:
+            _, current_eps = self.config.discover.split(':')
+            current_eps = float(current_eps)
+        if 1 > current_eps > 0:
+            random_Acts, random_LogProbs = self.train_rollout_group.sample_action()
+            for agent_id in Acts.keys():
+                if self.train_rollout_group.random_generator.random()<= current_eps:
+                    Acts[agent_id] = random_Acts[agent_id]
+                    LogProbs[agent_id] = random_LogProbs[agent_id]
+
+        return Acts, LogProbs
+        
+
+
+
+    
+    def optimize_while_rollout(self, n: int, 
+                      verbose: Optional[Callable[[int], Any]] = None,
+                      **kwargs) -> dict:
+        """ Return the off-policy training for n steps """
+        if self._Obs is None:
+            # is first step
+            self._Obs, self._Info = self.train_rollout_group.reset()
+        if self._LastState is None:
+            self._LastState = self.learner_group.update_inference_state(None) # for rnn policy
+
+        train_metrics = []
+        for step in range(n):
+            # do one rollout step
+            Act, LogProb, self._LastState = self.learner_group.inference(self._Obs, 
+                                                                   sample=False,
+                                                                   last_state=self._LastState)
+            Act, LogProb = self.wrap_with_discovery(Act, LogProb)
+            Obs, Rew, Ter, Trunc, Info = self.train_rollout_group.step(actions=Act,
+                                                                      log_probs=LogProb)
+            train_metric = self.learner_group.optimize_step(**self.get_sample())
+            train_metrics.append(train_metric)
+            if verbose is not None:
+                verbose.update(1)
+
+            # prepare for next step
+            self._Obs, self._Info = Obs, Info
+            Done = MulBatched({
+                agent_id: BatchBasic(
+                    data=np.logical_or(Ter[agent_id].data.astype(bool), Trunc[agent_id].data.astype(bool)),
+                    batch_mask=np.logical_or(Ter[agent_id].batch_mask.astype(bool), Trunc[agent_id].batch_mask.astype(bool))
+                ) for agent_id in self.agents
+            })
+            self._LastState = self.learner_group.update_inference_state(last_state=self._LastState, Done=Done)
+                    
+            # we reset the state to 0 for new episode, because rollout group is auto reset
+        return {k: np.sum([v[k] for v in train_metrics]) \
+                      for k in train_metrics[0]}
+
+    
+    def state_dict(self) -> dict:
+        return {}
+    
+    def load_state_dict(self, state_dict: dict)-> bool:
+        return True
     
 class QmixLearner(LearnerGroup):
     def __init__(self, 
@@ -643,7 +936,7 @@ if __name__=='__main__':
 
     def eval_and_save(step, file_path):
         mode = "a" if os.path.exists(file_path) else "w"
-        eval_metrics = on_result_callback(qmix.eval_fn2(n_episode=32, verbose=tqdm(desc="Evaluating...")))
+        eval_metrics = on_result_callback(qmix.eval_fn(n_episode=32, verbose=tqdm(desc="Evaluating...")))
         eval_metrics["step"] = step
         with open(file_path, mode, encoding="utf-8") as f:
             f.write(json.dumps(eval_metrics, ensure_ascii=False) + "\n")

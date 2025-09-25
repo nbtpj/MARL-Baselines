@@ -1,9 +1,10 @@
-from .envs import *
 import numpy as np
 import pandas as pd
 from typing import Dict, Any
 # try:
 def init_gfootball():
+    from gfootball.env.petting_zoo import GFootBall
+
     return GFootBall(
         max_cycles=1000,
         env_name="11_vs_11_stochastic",
@@ -17,6 +18,7 @@ def init_gfootball():
 
 
 def init_smacv2():
+    from smacv2.env.pettingzoo import StarCraft2PZEnv as StarCraft2
     distribution_config = {
         "n_units": 5,
         "n_enemies": 5,
@@ -36,10 +38,10 @@ def init_smacv2():
         },
     }
     max_cycles_default = 1000
-    env = PSmac(max_cycles=max_cycles_default,
+    env = StarCraft2.parallel_env22(max_cycles=max_cycles_default,
         render_mode='rgb_array',
         capability_config=distribution_config,
-        map_name="10gen_terran",
+        map_name="10gen_terran_v2",
         debug=True,
         conic_fov=False,
         obs_own_pos=True,
@@ -49,9 +51,11 @@ def init_smacv2():
     )
     return env
 
-def init_smac():
+def init_smac3m():
+    from smac.env.pettingzoo import StarCraft2PZEnv as StarCraft1
+
     max_cycles_default = 1000
-    env = PSSmac(max_cycles=max_cycles_default,
+    env = StarCraft1.parallel_env(max_cycles=max_cycles_default,
         render_mode='rgb_array',
         map_name="3m",
     )
@@ -148,10 +152,10 @@ def summarize_smac_results(result_dict: Dict[str, Any]) -> Dict[str, pd.DataFram
 ENV = {
     'gfootball':init_gfootball,
     'smacv2': init_smacv2,
-    'smac': init_smac,
+    'smac3m': init_smac3m,
 }
 
 READ_RESULT = {
     'smacv2': summarize_smac_results,
-    'smac': summarize_smac_results,
+    'smac3m': summarize_smac_results,
 }

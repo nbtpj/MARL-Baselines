@@ -7,9 +7,9 @@ One-file implementation (inspired by cleanRL) of different marl algorithms.
 - Check the availability of the environment in the [`./register_env.py`](./register_env.py) (It provide a mapping from environment id (str) to initialize function (callable))
 - Check the availability of the environment in the [`./hparams.py`](./hparams.py) (It provide a mapping from (environment id, algorithm name) (tuple of (str, \[file name without .py\])) to hyperparameter dict)
 
-- The training loop is configed and run at each file. For example to run qmix on environment name `smac:mm`
+- The training loop is configed and run at each file. For example to run qmix on environment name `smac3m`
 ```bash
-python qmix.py --env smac:mm
+python -m marl_utils.qmix --env smac3m
 ```
 ## Scale
 

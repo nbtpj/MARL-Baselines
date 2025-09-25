@@ -485,7 +485,6 @@ class Algorithm:
             train_metrics.append(train_metric)
             if verbose is not None:
                 verbose.update(1)
-        eval_metric = self.eval_fn()
         return {k: np.sum([v[k] for v in train_metrics]) \
                       for k in train_metrics[0]}
     
@@ -915,7 +914,7 @@ if __name__=='__main__':
 
     algo = Path(__file__).stem
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, help="Environment name in register_env.py", default="smac")
+    parser.add_argument('--env', type=str, help="Environment name in register_env.py", default="smac3m")
     parser.add_argument('--seed', type=int, help="Random seed", default=42)
     parser.add_argument('--pre-collect', type=int, help="Pre-trained # data-collecting steps", default=500)
     parser.add_argument('--n', type=int, help="Total # training steps", default=2_000_000)

@@ -1,5 +1,5 @@
 HPARAMS = {
-    ('smac', 'qmix'): dict(each_rollout_worker_resources={'num_cpus':2},
+    ('smac3m', 'qmix'): dict(each_rollout_worker_resources={'num_cpus':2},
                     n_rollout_worker=10, 
                     devices=["cuda:0"],
                     n_evalrollout_worker=2,

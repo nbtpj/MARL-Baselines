@@ -58,6 +58,35 @@ def init_smac3m():
     env = StarCraft1.parallel_env(max_cycles=max_cycles_default,
         render_mode='rgb_array',
         map_name="3m",
+          continuing_episode= False,
+        difficulty= "7",
+        # game_version= null,
+        # map_name= "3m",
+        move_amount= 2,
+        obs_all_health= True,
+        obs_instead_of_state= False,
+        obs_last_action= False,
+        obs_own_health= True,
+        obs_pathing_grid= False,
+        obs_terrain_height= False,
+        obs_timestep_number= False,
+        reward_death_value= 10,
+        reward_defeat= 0,
+        reward_negative_scale= 0.5,
+        reward_only_positive= True,
+        reward_scale= True,
+        reward_scale_rate= 20,
+        reward_sparse= False,
+        reward_win= 200,
+        replay_dir= "",
+        replay_prefix= "",
+        state_last_action= True,
+        state_timestep_number= False,
+        step_mul= 8,
+        # seed= null,
+        heuristic_ai= False,
+        heuristic_rest= False,
+        debug= False
     )
     return env
 
@@ -146,8 +175,15 @@ def summarize_smac_results(result_dict: Dict[str, Any]) -> Dict[str, pd.DataFram
         'win_rate_mean'   :[v[0] for v in win_stats.values()],
         'win_rate_std'    :[v[1] for v in win_stats.values()],
     }, index=list(allies_stats.keys()))
+    interested = {}
 
-    return {'return': return_df.to_json(), 'eps_len': epslen_df.to_json(), 'game_info': game_df.to_json()}
+    for key, df in zip(['return','eps_len','game_info'], [return_df, epslen_df, game_df]):
+        if key == 'game_info':
+            interested[key] = {col: df.loc['overall', col] for col in df.columns}
+        else:
+            interested[key] = {col: df.loc['overall', col] for col in df.columns}
+
+    return interested
 
 ENV = {
     'gfootball':init_gfootball,

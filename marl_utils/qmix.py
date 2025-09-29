@@ -17,6 +17,11 @@ from tqdm import trange
 import itertools
 
 import copy
+import torch as th
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
 
 def batch_flatten(space: spaces.Space, xs: np.ndarray)->np.ndarray:
     return np.array([flatten(space, x) for x in xs])
@@ -29,6 +34,15 @@ def batch_unflatten(space: spaces.Space, xs: np.ndarray)->np.ndarray:
 
 def batch_seq_unflatten(space: spaces.Space, xs: np.ndarray)->np.ndarray:
     return np.array([[unflatten(space, x) for x in _xs] for _xs in xs])
+
+
+def all_spaces_equal(space_dict: dict[str, spaces.Space]) -> bool:
+    vals = list(space_dict.values())
+    if not vals:      # empty dict -> trivially True
+        return True
+    first = vals[0]
+    return all(v == first for v in vals[1:])
+
 
 def Polyak_update(model: nn.Module, target_model: nn.Module, tau):
     for param, target_param in zip(model.parameters(), target_model.parameters()):
@@ -82,6 +96,62 @@ def mask_before_last(mask: np.ndarray) -> np.ndarray:
     out = np.zeros_like(mask)
     out[np.arange(len(mask)), before_last] = 1
     return out
+
+
+class QMixer(nn.Module):
+    def __init__(self, state_dim, n_agents, hidden_layers=[256,], *args, **kwargs):
+        super(QMixer, self).__init__()
+
+        self.n_agents = n_agents
+        self.state_dim = int(state_dim)
+        self.embed_dim = hidden_layers[-1]
+        hypernet_layers = len(hidden_layers)
+
+
+        if hypernet_layers == 1:
+            self.hyper_w_1 = nn.Linear(self.state_dim, self.embed_dim * self.n_agents)
+            self.hyper_w_final = nn.Linear(self.state_dim, self.embed_dim)
+        elif hypernet_layers == 2:
+            hypernet_embed = hidden_layers[0]
+            self.hyper_w_1 = nn.Sequential(nn.Linear(self.state_dim, hypernet_embed),
+                                           nn.ReLU(),
+                                           nn.Linear(hypernet_embed, self.embed_dim * self.n_agents))
+            self.hyper_w_final = nn.Sequential(nn.Linear(self.state_dim, hypernet_embed),
+                                           nn.ReLU(),
+                                           nn.Linear(hypernet_embed, self.embed_dim))
+        elif hypernet_layers > 2:
+            raise Exception("Sorry >2 hypernet layers is not implemented!")
+        else:
+            raise Exception("Error setting number of hypernet layers.")
+
+        # State dependent bias for hidden layer
+        self.hyper_b_1 = nn.Linear(self.state_dim, self.embed_dim)
+
+        # V(s) instead of a bias for the last layers
+        self.V = nn.Sequential(nn.Linear(self.state_dim, self.embed_dim),
+                               nn.ReLU(),
+                               nn.Linear(self.embed_dim, 1))
+
+    def forward(self, state: torch.Tensor, q_values: torch.Tensor):
+        bs = q_values.size(0)
+        states = state.reshape(-1, self.state_dim)
+        q_values = q_values.view(-1, 1, self.n_agents)
+        # First layer
+        w1 = th.abs(self.hyper_w_1(states))
+        b1 = self.hyper_b_1(states)
+        w1 = w1.view(-1, self.n_agents, self.embed_dim)
+        b1 = b1.view(-1, 1, self.embed_dim)
+        hidden = F.elu(th.bmm(q_values, w1) + b1)
+        # Second layer
+        w_final = th.abs(self.hyper_w_final(states))
+        w_final = w_final.view(-1, self.embed_dim, 1)
+        # State-dependent bias
+        v = self.V(states).view(-1, 1, 1)
+        # Compute final output
+        y = th.bmm(hidden, w_final) + v
+        # Reshape and return
+        q_tot = y.view(bs, -1, 1)
+        return None, q_tot
 
 class Policy(nn.Module):
     """
@@ -151,7 +221,7 @@ class Policy(nn.Module):
             #         "Sampled an invalid action!"
 
             actions = F.one_hot(actions, num_classes=log_probs.shape[-1]).float()
-            log_probs = (actions * log_probs.exp()).sum(dim=-1, keepdims=True)
+            log_probs = (actions * log_probs).sum(dim=-1, keepdims=True)
         return actions, log_probs, last_state
         
     def get_log_probs(self, obs: torch.Tensor, 
@@ -176,7 +246,7 @@ class Policy(nn.Module):
             log_probs = F.log_softmax(logits, dim=-1)
             # if actions.shape[-1] != 
             # actions = F.one_hot(actions, num_classes=log_probs.shape[-1]).float()
-            log_probs = (actions.float() * log_probs.exp()).sum(dim=-1, keepdims=True)
+            log_probs = (actions.float() * log_probs).sum(dim=-1, keepdims=True)
         return log_probs
         
     def reset_state(self, last_state:Any, done: Union[np.ndarray, torch.Tensor, None]):
@@ -243,28 +313,6 @@ class Critic(nn.Module):
                 return (Qs * act).sum(dim=-1, keepdims=True), Qs.amax(dim=-1, keepdims=True)
             else:
                 return Qs, Qs.amax(dim=-1, keepdims=True)
-
-class HyperMix(nn.Module):
-    def __init__(self, state_dim, n_agents, hidden_layers=[256,], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.state_dim = state_dim
-        self.n_agents = n_agents
-        self.neural = build_mlp(
-            [self.state_dim, *hidden_layers, self.n_agents]
-        )
-
-    def forward(self, state: torch.Tensor, q_values: torch.Tensor = None):
-        """q_values must be stacked on the last dim"""
-        w = torch.abs(self.neural(state))
-
-        if q_values is None:
-            return w
-        # print(w.shape)
-        # print(q_values.shape)   
-
-        q_tol = (w * q_values).sum(dim=-1, keepdim=True)
-        return w, q_tol
-
 
 @dataclass
 class Config:
@@ -564,6 +612,7 @@ class QmixLearner(LearnerGroup):
                  devices: Dict[str, str],
                  state_dim: int,
                  target_update: str,
+                 share_policy: bool = False,
                  input_tau_i: bool = False,
                  gamma: float = 0.99,
                  lr: float = 3e-5,
@@ -575,11 +624,6 @@ class QmixLearner(LearnerGroup):
         self.lr = lr
         self.devices = devices
 
-        self.policies: Dict[str, Policy] = {}
-        self.critics: Dict[str, Critic] = {}
-        self.observation_spaces: Dict[str, spaces.Space] = {}
-        self.target_policies: Dict[str, Policy] = {}
-        self.target_critics: Dict[str, Critic] = {}
 
         t_update_fn, interval, tau = target_update.split(':')
         self.t_update_fn = TARGET_UPDATE[t_update_fn]
@@ -587,11 +631,33 @@ class QmixLearner(LearnerGroup):
         self.tau = float(tau)
 
         self.optimizers = {}
+        self.init_spaces(observation_spaces=observation_spaces, 
+                         action_spaces=action_spaces)
+        
+        self.share_policy = share_policy \
+            and all_spaces_equal(self.observation_spaces)\
+            and all_spaces_equal(self.action_spaces) # whether to share policy and critic parameters
+
+        self.init_agent(observation_spaces=observation_spaces,
+                        action_spaces=action_spaces,
+                        devices=devices,
+                        state_dim=state_dim,
+                        target_update=target_update,
+                        input_tau_i=input_tau_i,
+                        gamma=gamma,
+                        lr=lr,
+                        hyper_hidden_layers=hyper_hidden_layers,
+                        **kwargs)
+        
+        self.is_discrete = isinstance(self.U_space, spaces.MultiDiscrete)
+        self.gamma = gamma
+        self.global_step = 0
+
+    def init_spaces(self, observation_spaces, action_spaces):
+
         self.action_spaces = action_spaces
-
-
+        self.observation_spaces: Dict[str, spaces.Space] = {}
         for agent_id in self.agents:
-            device = devices[agent_id]
             if isinstance(observation_spaces[agent_id], spaces.Dict)\
                 and "observation" in observation_spaces[agent_id].spaces:
                 # observation_spaces[agent_id]: spaces.Dict
@@ -605,6 +671,39 @@ class QmixLearner(LearnerGroup):
                 # and "observation" in observation_spaces[agent_id].spaces)
                 flatten_obs_space = flatten_space(observation_spaces[agent_id])
             self.observation_spaces[agent_id] = flatten_obs_space
+        self.U_space = stack_action_spaces(*[self.action_spaces[agent_id] for agent_id in self.agents])
+
+
+    def init_agent(self, observation_spaces: Dict[str, spaces.Space],
+                   action_spaces: Dict[str, spaces.Space],
+                   devices: Dict[str, str],
+                   state_dim: int,
+                   target_update: str,
+                   input_tau_i: bool = False,
+                   gamma: float = 0.99,
+                   lr: float = 3e-5,
+                   hyper_hidden_layers: List = [256,],
+                   **kwargs):       
+
+
+        self.policies: Dict[str, Policy] = {}
+        self.critics: Dict[str, Critic] = {}
+        self.target_policies: Dict[str, Policy] = {}
+        self.target_critics: Dict[str, Critic] = {}
+        action_spaces = self.action_spaces
+        for agent_id in self.agents:
+            device = devices[agent_id]
+            flatten_obs_space = self.observation_spaces[agent_id]
+            
+            if len(self.policies)>0 and self.share_policy:
+                # share policy and critic
+                self.policies[agent_id] = self.policies[self.agents[0]]
+                self.critics[agent_id] = self.critics[self.agents[0]]
+                self.target_policies[agent_id] = self.target_policies[self.agents[0]]
+                self.target_critics[agent_id] = self.target_critics[self.agents[0]]
+                # self.optimizers[agent_id] = self.optimizers[self.agents[0]]
+
+                continue
             self.policies[agent_id] = Policy(observation_space=flatten_obs_space,
                                               action_space=action_spaces[agent_id],
                                               input_tau_i=input_tau_i, **kwargs).to(device)
@@ -618,21 +717,16 @@ class QmixLearner(LearnerGroup):
                 lr=self.lr
             )
 
-        self.hyper_net = HyperMix(state_dim=state_dim, 
+        self.hyper_net = QMixer(state_dim=state_dim, 
                                   n_agents=len(self.agents), 
                                   hidden_layers=hyper_hidden_layers).to(devices['hyper_net'])
-        
+        self.target_hyper_net = copy.deepcopy(self.hyper_net)
+
         self.optimizers['hyper_net'] = torch.optim.Adam(
             self.hyper_net.parameters(),
                 lr=self.lr
             )
-        self.target_hyper_net = copy.deepcopy(self.hyper_net)
-
-        self.U_space = stack_action_spaces(*[self.action_spaces[agent_id] for agent_id in self.agents])
-        self.is_discrete = isinstance(self.U_space, spaces.MultiDiscrete)
-        self.gamma = gamma
-        self.global_step = 0
-
+  
     
     def load_state_dict(self, state_dict)-> bool:
         raise NotImplementedError
@@ -657,7 +751,7 @@ class QmixLearner(LearnerGroup):
                   sample: bool, 
                   last_state: Any,
                   **kwargs)-> Tuple[MulAction, MulBatched, Optional[Dict]]:
-        
+        # in inference, pytorch is safe for threading
         batch_mask = {
             agent_id: np.logical_and(o.batch_mask, o.action_mask.sum(axis=-1)>0) \
                 if o.action_mask is not None else o.batch_mask
@@ -746,7 +840,6 @@ class QmixLearner(LearnerGroup):
 
 
         def forward_policy_and_q(agent_id):
-
             policy, critic = self.policies[agent_id],  self.critics[agent_id]
 
             def to_torch(any):
@@ -757,15 +850,14 @@ class QmixLearner(LearnerGroup):
             _action_mask = to_torch(obs[agent_id].action_mask) if obs[agent_id].action_mask is not None else None
 
             policy_loss = None
-            log_probs = policy.get_log_probs(_obs, _flatten_act, action_mask=_action_mask)
-            Q, max_val = critic(obs=_obs, act=_action_mask)
+            Q, max_val = critic(obs=_obs, act=_flatten_act)
             # we mul with each-agent mask here
             # print(_flatten_act.shape)
             # print(Q.shape)
             # print(log_probs.shape)
             # print(_mask.shape)
-            policy_loss = -(log_probs * Q * _mask)/(_mask.sum() + 1e-4)
-            policy_loss = policy_loss.sum()
+            log_probs = policy.get_log_probs(_obs, _flatten_act, action_mask=_action_mask)
+            policy_loss = -(log_probs * Q.detach() * _mask)/(_mask.sum() + 1e-4).sum()
 
             if self.global_step % self.t_update_interval == 0:
                 self.t_update_fn(self.policies[agent_id], self.target_policies[agent_id], self.tau)
@@ -779,6 +871,7 @@ class QmixLearner(LearnerGroup):
         
 
         def get_V_next_step(agent_id):
+            # this is always safe for threading
             def to_torch(any):
                 return torch.as_tensor(any, device=self.devices[agent_id], dtype=torch.float32)
             with torch.no_grad():
@@ -791,7 +884,7 @@ class QmixLearner(LearnerGroup):
                 else:
                     # use target policy to estimate in continuous space
                     flatten_act, _ , _ = policy.forward(_obs, action_mask=_action_mask, sample=True)
-                    max_val, _ = critic(obs=obs, act=flatten_act)
+                    max_val, _ = critic(obs=_obs, act=flatten_act)
 
             return dict(max_val=max_val, agent_id=agent_id)
 
@@ -840,7 +933,7 @@ class QmixLearner(LearnerGroup):
             Q_tar = torch.cat([target_dec_results[agent_id]['max_val'].to(device=self.devices['hyper_net'])
                                 for agent_id in self.agents], dim=-1)
             _, Q_tol_tar = self.target_hyper_net(state=State, q_values=Q_tar)
-            Q_target = R[:, :-1, :] + self.gamma * AllTer[:, :-1, :] * Q_tol_tar[:, 1:, :]
+            Q_target = R[:, :-1, :] + self.gamma * (1.0 -AllTer[:, :-1, :]) * Q_tol_tar[:, 1:, :]
 
         Td_error = (Q_tol[:, :-1, :] - Q_target)**2 * Mask[:, :-1, :]/(Mask[:, :-1, :].sum() + 1e-4)
         Td_error = Td_error.mean()
@@ -848,6 +941,7 @@ class QmixLearner(LearnerGroup):
         policy_loss = [dec_results[agent_id]['policy_loss'].to(device=self.devices['hyper_net']) for agent_id in self.agents]
         policy_loss = torch.stack(policy_loss).mean()
 
+        # total_loss = Td_error/(Td_error.abs().detach()+1) + policy_loss/(policy_loss.abs().detach()+1)
         total_loss = Td_error + policy_loss
 
         for k in self.optimizers:
@@ -866,6 +960,7 @@ class QmixLearner(LearnerGroup):
 
 @dataclass
 class QMixConfig(Config):
+    share_policy: bool = True
     state_dim: int = 0
     input_tau_i: bool = True
     target_update: str = 'Polyak_update:32:0.005'
@@ -884,6 +979,7 @@ class QMix(Algorithm):
         learner_group = QmixLearner(observation_spaces=self.train_rollout_group.observation_spaces[0],
                                     action_spaces=self.train_rollout_group.action_spaces[0],
                                     devices=self.config.devices,
+                                    share_policy=self.config.share_policy,
                                     target_update=self.config.target_update,
                                     state_dim = self.config.state_dim,
                  input_tau_i = self.config.input_tau_i,
@@ -949,8 +1045,9 @@ if __name__=='__main__':
     tbar = trange(args.n,desc="Training...")
 
     for i in range(1, math.ceil(args.n/1000)+1):
-        qmix.optimize_while_rollout(1000, verbose=tbar)
+        infos = qmix.optimize_while_rollout(1000, verbose=tbar)
         eval_metrics = eval_and_save(i*1000, result_files)
+        print(infos)
         print(eval_metrics)
     
 
